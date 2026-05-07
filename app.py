@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import unicodedata
 from pathlib import Path
 from urllib.parse import urlencode
@@ -13,6 +14,11 @@ app = Flask(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE_NAME = "base_classificada_por_ciclo.csv"
 DATA_FILE = BASE_DIR / DATA_FILE_NAME
+MD_FILE_NAME = "Script_Padrao_Abertura_Jiras_Suporte_MEC.md"
+MD_FILE = BASE_DIR / MD_FILE_NAME
+PDF_FILE_NAME = "padrao_abertura_jiras_suporte_MEC_atualizado.pdf"
+PDF_FILE = BASE_DIR / PDF_FILE_NAME
+PAGE_SIZE = 20
 
 FILTERS = [
     ("ano", "Ano", "Ano"),
@@ -75,7 +81,7 @@ def strip_accents(value: str) -> str:
 
 
 def escape(value) -> str:
-    return html.escape(str(value if value is not None else ""))
+    return html.escape(str(value if value is not None else ""), quote=True)
 
 
 def fmt_int(value: int | float) -> str:
@@ -105,7 +111,6 @@ def load_dataframe() -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
 
-    # Normalizações leves para evitar filtros vazios por espaço ou número como texto quebrado.
     for col in df.columns:
         df[col] = df[col].astype(str).str.strip()
 
@@ -250,7 +255,7 @@ def ranking_table(df: pd.DataFrame, col: str, title_col: str, limit: int = 10) -
 def responsible_table(df: pd.DataFrame, limit: int = 12) -> str:
     total = len(df)
     if df.empty or "Responsável" not in df.columns:
-        return '<tr><td colspan="7" class="empty">Sem dados para os filtros selecionados.</td></tr>'
+        return '<tr><td colspan="8" class="empty">Sem dados para os filtros selecionados.</td></tr>'
 
     work = df.copy()
     work["Responsável"] = work["Responsável"].replace("", "Não informado")
@@ -258,7 +263,6 @@ def responsible_table(df: pd.DataFrame, limit: int = 12) -> str:
     for responsavel, group in work.groupby("Responsável", dropna=False):
         qtd = len(group)
         finalizados = count_contains(group, "Status executivo", "Finalizado")
-        backlog = count_contains(group, "Status executivo", "Backlog")
         alto = count_contains(group, "Impacto", "Alto")
         principal_categoria = (
             group["Categoria problema"].replace("", "Não informado").value_counts().index[0]
@@ -277,7 +281,6 @@ def responsible_table(df: pd.DataFrame, limit: int = 12) -> str:
                 "%": fmt_pct(qtd, total),
                 "Finalizados": finalizados,
                 "Taxa": fmt_pct(finalizados, qtd),
-                "Backlog": backlog,
                 "Alto": alto,
                 "Categoria": principal_categoria,
                 "Resolução": resolucao,
@@ -347,12 +350,39 @@ def platform_matrix(df: pd.DataFrame) -> str:
     return "".join(rows)
 
 
-def records_table(df: pd.DataFrame, limit: int = 250) -> str:
+def get_current_page(total: int, per_page: int = PAGE_SIZE) -> tuple[int, int, int, int]:
+    total_pages = max(1, math.ceil(total / per_page))
+    try:
+        page = int(request.args.get("page", "1"))
+    except Exception:
+        page = 1
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = min(start + per_page, total)
+    return page, total_pages, start, end
+
+
+def query_string_with_page(page: int) -> str:
+    pairs = []
+    for k, v in request.args.items():
+        if k in {"page", "scroll_y"}:
+            continue
+        if v and v != "Todos":
+            pairs.append((k, v))
+    pairs.append(("page", str(page)))
+    return urlencode(pairs)
+
+
+def records_table(df: pd.DataFrame, page: int, per_page: int = PAGE_SIZE) -> str:
     if df.empty:
         return '<tr><td colspan="9" class="empty">Nenhum Jira encontrado para os filtros selecionados.</td></tr>'
 
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_df = df.iloc[start:end]
+
     rows = []
-    for _, r in df.head(limit).iterrows():
+    for _, r in page_df.iterrows():
         rows.append(
             f"""
             <tr>
@@ -371,9 +401,64 @@ def records_table(df: pd.DataFrame, limit: int = 250) -> str:
     return "".join(rows)
 
 
+def pagination_controls(total: int, page: int, total_pages: int, start: int, end: int) -> str:
+    if total == 0:
+        return ""
+
+    def link(label: str, target: int, disabled: bool = False, active: bool = False) -> str:
+        cls = "page-link"
+        if disabled:
+            cls += " disabled"
+            return f'<span class="{cls}">{escape(label)}</span>'
+        if active:
+            cls += " active"
+        return f'<a class="{cls}" data-preserve-scroll="true" href="/?{query_string_with_page(target)}">{escape(label)}</a>'
+
+    pages = []
+    pages.append(link("‹ Anterior", page - 1, disabled=page <= 1))
+    window_start = max(1, page - 2)
+    window_end = min(total_pages, page + 2)
+    if window_start > 1:
+        pages.append(link("1", 1, active=page == 1))
+        if window_start > 2:
+            pages.append('<span class="page-ellipsis">...</span>')
+    for p in range(window_start, window_end + 1):
+        pages.append(link(str(p), p, active=p == page))
+    if window_end < total_pages:
+        if window_end < total_pages - 1:
+            pages.append('<span class="page-ellipsis">...</span>')
+        pages.append(link(str(total_pages), total_pages, active=page == total_pages))
+    pages.append(link("Próxima ›", page + 1, disabled=page >= total_pages))
+
+    return f"""
+    <div class="pagination">
+        <div class="pagination-info">
+            Exibindo <strong>{fmt_int(start + 1)}</strong> a <strong>{fmt_int(end)}</strong> de <strong>{fmt_int(total)}</strong> registros filtrados · 20 por página
+        </div>
+        <nav aria-label="Paginação dos registros filtrados">{''.join(pages)}</nav>
+    </div>
+    """
+
+
 def current_query_without_empty() -> str:
-    pairs = [(k, v) for k, v in request.args.items() if v and v != "Todos"]
+    pairs = [(k, v) for k, v in request.args.items() if v and v != "Todos" and k not in {"page", "scroll_y"}]
     return urlencode(pairs)
+
+
+def active_filter_summary() -> str:
+    active = []
+    for param, _col, label in FILTERS:
+        value = request.args.get(param, "Todos")
+        if value and value != "Todos":
+            active.append(f"{label}: {value}")
+    q = request.args.get("q", "").strip()
+    if q:
+        active.append(f"Busca: {q}")
+    if not active:
+        return "Nenhum filtro aplicado. Clique na seta para selecionar ciclo, produto, status, categoria, equipe ou responsável."
+    if len(active) <= 3:
+        return "Filtros ativos · " + " · ".join(active)
+    return "Filtros ativos · " + " · ".join(active[:3]) + f" · +{len(active)-3} filtro(s)"
 
 
 def render_error(message: str) -> str:
@@ -391,6 +476,44 @@ def render_error(message: str) -> str:
     </html>
     """
 
+
+@app.route("/download-md")
+def download_md() -> Response:
+    if not MD_FILE.exists():
+        fallback = (
+            "# Script padrão para abertura de Jiras MEC\n\n"
+            "Arquivo padrão não encontrado na pasta do sistema. "
+            "Inclua o arquivo Script_Padrao_Abertura_Jiras_Suporte_MEC.md junto ao app.py."
+        )
+        return Response(
+            fallback,
+            mimetype="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={MD_FILE_NAME}"},
+            status=200,
+        )
+
+    content = MD_FILE.read_text(encoding="utf-8")
+    return Response(
+        content,
+        mimetype="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={MD_FILE_NAME}"},
+    )
+
+
+@app.route("/download-pdf")
+def download_pdf() -> Response:
+    if not PDF_FILE.exists():
+        return Response(
+            f"Arquivo PDF não encontrado na pasta do sistema: {PDF_FILE_NAME}",
+            mimetype="text/plain; charset=utf-8",
+            status=404,
+        )
+
+    return Response(
+        PDF_FILE.read_bytes(),
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={PDF_FILE_NAME}"},
+    )
 
 @app.route("/download")
 def download() -> Response:
@@ -418,14 +541,15 @@ def index() -> str:
     backlog = count_contains(df, "Status executivo", "Backlog")
     andamento = count_contains(df, "Status executivo", "Em andamento")
     plataforma = int(df.apply(is_platform_config, axis=1).sum()) if not df.empty else 0
-    resultados = count_contains(df, "Categoria problema", "Resultados") + count_contains(df, "Resumo", "resultado")
 
     filtros = "".join(select_html(full_df, param, col, label) for param, col, label in FILTERS)
     q = request.args.get("q", "")
     query = current_query_without_empty()
     download_url = f"/download?{query}" if query else "/download"
-
+    page, total_pages, start, end = get_current_page(total, PAGE_SIZE)
+    paginacao = pagination_controls(total, page, total_pages, start, end)
     leitura = build_executive_reading(df, total_base)
+    resumo_filtros = active_filter_summary()
 
     return f"""<!doctype html>
 <html lang="pt-br">
@@ -449,24 +573,29 @@ def index() -> str:
 </header>
 
 <main class="container">
-    <section class="panel filter-panel">
-        <div class="section-title">
-            <div>
-                <h2>Filtros da análise</h2>
-                <p>Use os filtros abaixo para recalcular todos os indicadores, rankings, responsáveis e registros.</p>
-            </div>
-            <a class="ghost" href="/">Limpar filtros</a>
-        </div>
-        <form method="get" action="/" class="filters">
-            {filtros}
-            <div class="field field-search">
-                <label for="q">Busca livre no texto do Jira</label>
-                <input id="q" name="q" value="{escape(q)}" placeholder="Ex.: resultado, upload, permissão, aluno, card...">
-            </div>
-            <div class="actions">
-                <button type="submit">Aplicar filtros</button>
-            </div>
-        </form>
+    <section class="sticky-filter-shell">
+        <details class="filter-drawer">
+            <summary class="filter-summary">
+                <div>
+                    <strong>Filtros da análise</strong>
+                    <small>{escape(resumo_filtros)}</small>
+                </div>
+                <span class="filter-arrow" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M6 9l6 6 6-6"></path></svg></span>
+            </summary>
+            <form method="get" action="/" class="filters" id="filter-form">
+                <input type="hidden" id="scroll_y" name="scroll_y" value="0">
+                {filtros}
+                <div class="field field-search">
+                    <label for="q">Busca livre no texto do Jira</label>
+                    <input id="q" name="q" value="{escape(q)}" placeholder="Ex.: resultado, upload, permissão, aluno, card...">
+                </div>
+                <div class="actions">
+                    <button type="submit">Aplicar filtros</button>
+                    <a class="button-secondary" href="/">Limpar filtros</a>
+                    <a class="button-secondary" href="/download-pdf">Baixar guia Jira (.pdf)</a>
+                </div>
+            </form>
+        </details>
     </section>
 
     <section class="metrics">
@@ -522,16 +651,56 @@ def index() -> str:
     </section>
 
     <section class="panel">
-        <div class="section-title">
+        <div class="section-title records-title">
             <div>
                 <h2>Registros filtrados</h2>
-                <p>Exibição limitada aos primeiros 250 registros para manter a tela leve. Baixe a base filtrada para ver tudo.</p>
+                <p>Exibição paginada em 20 registros por página para facilitar a leitura e apresentação. O botão de exportação baixa todos os registros filtrados.</p>
             </div>
-            <a class="ghost" href="{escape(download_url)}">Exportar CSV</a>
         </div>
-        <div class="table-wrap records"><table><thead><tr><th>Jira</th><th>Ciclo</th><th>Produto</th><th>Resumo</th><th>Natureza</th><th>Equipe</th><th>Responsável</th><th>Status</th><th>Impacto</th></tr></thead><tbody>{records_table(df)}</tbody></table></div>
+        {paginacao}
+        <div class="table-wrap records"><table><thead><tr><th>Jira</th><th>Ciclo</th><th>Produto</th><th>Resumo</th><th>Natureza</th><th>Equipe</th><th>Responsável</th><th>Status</th><th>Impacto</th></tr></thead><tbody>{records_table(df, page, PAGE_SIZE)}</tbody></table></div>
+        {paginacao}
     </section>
 </main>
+
+<script>
+(function () {{
+    function currentScrollY() {{
+        return Math.max(0, Math.round(window.scrollY || document.documentElement.scrollTop || 0));
+    }}
+
+    const params = new URLSearchParams(window.location.search);
+    const scrollValue = params.get("scroll_y");
+    if (scrollValue !== null) {{
+        const y = parseInt(scrollValue, 10);
+        if (!Number.isNaN(y) && y > 0) {{
+            requestAnimationFrame(function () {{
+                window.scrollTo(0, y);
+            }});
+        }}
+        params.delete("scroll_y");
+        const cleanQuery = params.toString();
+        const cleanUrl = window.location.pathname + (cleanQuery ? "?" + cleanQuery : "") + window.location.hash;
+        window.history.replaceState({{}}, document.title, cleanUrl);
+    }}
+
+    const form = document.getElementById("filter-form");
+    const scrollInput = document.getElementById("scroll_y");
+    if (form && scrollInput) {{
+        form.addEventListener("submit", function () {{
+            scrollInput.value = String(currentScrollY());
+        }});
+    }}
+
+    document.querySelectorAll("a[data-preserve-scroll='true']").forEach(function (link) {{
+        link.addEventListener("click", function () {{
+            const url = new URL(link.href, window.location.origin);
+            url.searchParams.set("scroll_y", String(currentScrollY()));
+            link.href = url.pathname + url.search + url.hash;
+        }});
+    }});
+}})();
+</script>
 </body>
 </html>"""
 
@@ -557,32 +726,7 @@ def build_executive_reading(df: pd.DataFrame, total_base: int) -> str:
 def styles() -> str:
     return """
 <style>
-:root{
-    --bg:#f4f7fb;
-    --panel:#ffffff;
-    --ink:#122033;
-    --muted:#64748b;
-    --line:#e4eaf2;
-    --navy:#102a43;
-    --blue:#1f6feb;
-    --blue-dark:#1f4e78;
-    --green:#0f7b55;
-    --red:#b42318;
-    --orange:#b45309;
-    --purple:#6d28d9;
-    --shadow:0 18px 45px rgba(15, 23, 42, .09);
-    --radius:22px;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--ink)}
-a{color:inherit}
-.hero{background:linear-gradient(135deg,#071729 0%,#143b5d 56%,#1f6feb 100%);color:#fff;padding:34px 42px;display:grid;grid-template-columns:1fr 260px;gap:28px;align-items:end}
-.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:12px;font-weight:800;color:#b8d7ff;margin:0 0 12px}
-h1{font-size:36px;line-height:1.08;margin:0;max-width:980px}
-.subtitle{font-size:15px;color:#d7e9ff;max-width:860px;margin:14px 0 0}
-.hero-card{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);border-radius:18px;padding:20px;backdrop-filter:blur(10px)}
-.hero-card span,.hero-card small{display:block;color:#d7e9ff;font-size:13px}.hero-card strong{display:block;font-size:34px;margin:6px 0}
-.container{padding:28px 42px 52px;max-width:1540px;margin:0 auto}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px;margin-bottom:20px}.filter-panel{margin-top:-12px}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:16px}h2{font-size:20px;margin:0 0 6px}.section-title p,.hint{color:var(--muted);font-size:13px;margin:0 0 14px}.filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.field label{display:block;font-size:12px;font-weight:800;color:#334155;margin:0 0 7px}select,input{width:100%;height:43px;border:1px solid #cbd5e1;background:#fff;border-radius:12px;padding:0 12px;color:#172033;outline:none}select:focus,input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(31,111,235,.12)}.field-search{grid-column:span 2}.actions{display:flex;gap:10px;align-items:end}.actions button,.button-secondary,.ghost{border:0;border-radius:12px;height:43px;padding:0 15px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;font-weight:800;cursor:pointer;white-space:nowrap}.actions button{background:var(--blue-dark);color:white}.button-secondary{background:#eaf2ff;color:#174270}.ghost{background:#f1f5f9;color:#334155}.metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-bottom:20px}.metric{background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:20px;padding:18px;position:relative;overflow:hidden}.metric:before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:#94a3b8}.metric.primary:before{background:var(--blue)}.metric.danger:before{background:var(--red)}.metric.success:before{background:var(--green)}.metric.warning:before{background:var(--orange)}.metric.info:before{background:var(--blue-dark)}.metric.purple:before{background:var(--purple)}.metric span{display:block;color:var(--muted);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.metric strong{display:block;font-size:30px;margin:8px 0 4px}.metric small{color:var(--muted);font-size:12px}.insight{border-left:6px solid var(--blue-dark)}.insight p{font-size:15px;line-height:1.6;margin:0;color:#26374d}.grid.two{display:grid;grid-template-columns:1fr 1fr;gap:20px}.table-wrap{overflow:auto;border-radius:16px;border:1px solid var(--line)}table{width:100%;border-collapse:collapse;background:#fff;min-width:620px}th{background:#102a43;color:white;text-align:left;font-size:12px;letter-spacing:.03em;text-transform:uppercase;padding:12px}td{border-bottom:1px solid #edf2f7;padding:11px 12px;font-size:13px;vertical-align:top}tr:hover td{background:#f8fbff}.num-cell{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.bar{height:9px;background:#e5edf7;border-radius:99px;overflow:hidden;min-width:90px}.bar i{display:block;height:100%;background:linear-gradient(90deg,#1f4e78,#1f6feb);border-radius:99px}.pill{display:inline-flex;align-items:center;border-radius:99px;background:#eef4ff;color:#174270;padding:5px 9px;font-size:12px;font-weight:800;white-space:nowrap}.pill.impact{background:#fff4e6;color:#9a3412}.records table{min-width:1180px}.empty{text-align:center;color:var(--muted);padding:22px}.error-box{max-width:780px;margin:80px auto;background:#fff;border-radius:24px;padding:34px;box-shadow:var(--shadow);border:1px solid var(--line)}.error-box h1{color:var(--red);font-size:28px}@media(max-width:1180px){.hero{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(3,1fr)}.filters{grid-template-columns:repeat(2,1fr)}.grid.two{grid-template-columns:1fr}}@media(max-width:760px){.hero,.container{padding-left:18px;padding-right:18px}h1{font-size:28px}.metrics,.filters{grid-template-columns:1fr}.field-search{grid-column:auto}.actions{flex-direction:column;align-items:stretch}.grid.two{grid-template-columns:1fr}}
+:root{--bg:#f4f7fb;--panel:#ffffff;--ink:#122033;--muted:#64748b;--line:#e4eaf2;--navy:#102a43;--blue:#1f6feb;--blue-dark:#1f4e78;--green:#0f7b55;--red:#b42318;--orange:#b45309;--purple:#6d28d9;--shadow:0 18px 45px rgba(15, 23, 42, .09);--radius:22px}*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--ink)}a{color:inherit}.hero{background:linear-gradient(135deg,#071729 0%,#143b5d 56%,#1f6feb 100%);color:#fff;padding:34px 42px;display:grid;grid-template-columns:1fr 260px;gap:28px;align-items:end}.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:12px;font-weight:800;color:#b8d7ff;margin:0 0 12px}h1{font-size:36px;line-height:1.08;margin:0;max-width:980px}.subtitle{font-size:15px;color:#d7e9ff;max-width:860px;margin:14px 0 0}.hero-card{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);border-radius:18px;padding:20px;backdrop-filter:blur(10px)}.hero-card span,.hero-card small{display:block;color:#d7e9ff;font-size:13px}.hero-card strong{display:block;font-size:34px;margin:6px 0}.container{padding:0 42px 52px;max-width:1540px;margin:0 auto}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px;margin-bottom:20px}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:16px}h2{font-size:20px;margin:0 0 6px}.section-title p,.hint{color:var(--muted);font-size:13px;margin:0 0 14px}.sticky-filter-shell{position:sticky;top:0;z-index:20;margin:0 -42px 20px;padding:14px 42px 12px;background:linear-gradient(180deg,rgba(244,247,251,.98),rgba(244,247,251,.92));backdrop-filter:blur(12px);border-bottom:1px solid rgba(203,213,225,.75)}.filter-drawer{background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:0 12px 30px rgba(15, 23, 42, .08);overflow:hidden}.filter-drawer summary{list-style:none}.filter-drawer summary::-webkit-details-marker{display:none}.filter-summary{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:16px 18px;cursor:pointer}.filter-summary strong{display:block;font-size:17px}.filter-summary small{display:block;color:var(--muted);font-size:12px;margin-top:3px}.filter-arrow{display:grid;place-items:center;width:34px;height:34px;border-radius:999px;background:#eaf2ff;color:#174270;transition:background .2s ease,color .2s ease}.filter-arrow svg{width:18px;height:18px;stroke:currentColor;stroke-width:2.6;fill:none;stroke-linecap:round;stroke-linejoin:round;transition:transform .2s ease}.filter-drawer[open] .filter-arrow{background:#174270;color:#fff}.filter-drawer[open] .filter-arrow svg{transform:rotate(180deg)}.filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;padding:0 18px 18px;border-top:1px solid var(--line)}.field label{display:block;font-size:12px;font-weight:800;color:#334155;margin:14px 0 7px}select,input{width:100%;height:43px;border:1px solid #cbd5e1;background:#fff;border-radius:12px;padding:0 12px;color:#172033;outline:none}select:focus,input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(31,111,235,.12)}.field-search{grid-column:span 2}.actions{display:flex;gap:10px;align-items:end;padding-top:14px;flex-wrap:wrap}.actions button,.button-secondary,.ghost{border:0;border-radius:12px;height:43px;padding:0 15px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;font-weight:800;cursor:pointer;white-space:nowrap}.actions button{background:var(--blue-dark);color:white}.button-secondary{background:#eaf2ff;color:#174270}.ghost{background:#f1f5f9;color:#334155}.metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-bottom:20px}.metric{background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:20px;padding:18px;position:relative;overflow:hidden}.metric:before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:#94a3b8}.metric.primary:before{background:var(--blue)}.metric.danger:before{background:var(--red)}.metric.success:before{background:var(--green)}.metric.warning:before{background:var(--orange)}.metric.info:before{background:var(--blue-dark)}.metric.purple:before{background:var(--purple)}.metric span{display:block;color:var(--muted);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.metric strong{display:block;font-size:30px;margin:8px 0 4px}.metric small{color:var(--muted);font-size:12px}.insight{border-left:6px solid var(--blue-dark)}.insight p{font-size:15px;line-height:1.6;margin:0;color:#26374d}.grid.two{display:grid;grid-template-columns:1fr 1fr;gap:20px}.table-wrap{overflow:auto;border-radius:16px;border:1px solid var(--line)}table{width:100%;border-collapse:collapse;background:#fff;min-width:620px}th{background:#102a43;color:white;text-align:left;font-size:12px;letter-spacing:.03em;text-transform:uppercase;padding:12px}td{border-bottom:1px solid #edf2f7;padding:11px 12px;font-size:13px;vertical-align:top}tr:hover td{background:#f8fbff}.num-cell{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.bar{height:9px;background:#e5edf7;border-radius:99px;overflow:hidden;min-width:90px}.bar i{display:block;height:100%;background:linear-gradient(90deg,#1f4e78,#1f6feb);border-radius:99px}.pill{display:inline-flex;align-items:center;border-radius:99px;background:#eef4ff;color:#174270;padding:5px 9px;font-size:12px;font-weight:800;white-space:nowrap}.pill.impact{background:#fff4e6;color:#9a3412}.records table{min-width:1180px}.empty{text-align:center;color:var(--muted);padding:22px}.pagination{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:14px 0;flex-wrap:wrap}.pagination-info{font-size:13px;color:var(--muted)}.pagination nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.page-link,.page-ellipsis{height:36px;min-width:36px;padding:0 11px;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;font-weight:800;font-size:13px;border:1px solid var(--line);background:#fff;color:#334155}.page-link:hover{border-color:#9bbce8;color:#174270}.page-link.active{background:var(--blue-dark);color:#fff;border-color:var(--blue-dark)}.page-link.disabled{opacity:.45;cursor:not-allowed;background:#f1f5f9}.page-ellipsis{border:0;background:transparent;color:var(--muted);min-width:auto}.error-box{max-width:780px;margin:80px auto;background:#fff;border-radius:24px;padding:34px;box-shadow:var(--shadow);border:1px solid var(--line)}.error-box h1{color:var(--red);font-size:28px}@media(max-width:1180px){.hero{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(3,1fr)}.filters{grid-template-columns:repeat(2,1fr)}.grid.two{grid-template-columns:1fr}}@media(max-width:760px){.hero{padding-left:18px;padding-right:18px}.container{padding-left:18px;padding-right:18px}.sticky-filter-shell{margin-left:-18px;margin-right:-18px;padding-left:18px;padding-right:18px}h1{font-size:28px}.metrics,.filters{grid-template-columns:1fr}.field-search{grid-column:auto}.actions{flex-direction:column;align-items:stretch}.grid.two{grid-template-columns:1fr}.section-title{flex-direction:column}.records-title .ghost{width:100%}.pagination{align-items:flex-start}}
 </style>
 """
 
